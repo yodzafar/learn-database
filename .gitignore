@@ -1,0 +1,24 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+.idea/
+.vscode/
+# sqlite darslari bazalari
+*.db
+*.db-wal
+*.db-shm
+# dbt
+target/
+dbt_packages/
+logs/
+# katta datasetlar (generatsiya qilinadi yoki yuklab olinadi)
+datasets/
+*.parquet
+*.csv.gz
+.env
+clickhouse/data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

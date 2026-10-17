@@ -1,0 +1,4 @@
+# O'quv loyihasi asboblari. O'rnatish: make setup
+sqlfluff>=3.2
+pytest>=8.3
+psycopg[binary]>=3.2
