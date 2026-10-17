@@ -1,0 +1,69 @@
+# Time-series bazalar rejasi: TimescaleDB, InfluxDB 3, QuestDB va metrika tizimlari
+
+Nima uchun alohida: monitoring metrikalari, IoT sensorlar, moliyaviy kotirovkalar, ilova hodisalari: bularning hammasi "vaqt bo'yicha tartiblangan, asosan qo'shiladigan (append-only), yaqin vaqtga ko'p so'raladigan, eski ma'lumoti siqiladigan yoki o'chiriladigan" ma'lumot. Oddiy OLTP jadvali bunday yuklamada tez shishadi: indekslar katta, `DELETE` bilan retention qimmat, aggregatsiya sekin. Time-series bazalar shu xususiyatlardan foydalanadi: vaqt bo'yicha bo'laklash (chunk), columnar siqish, oldindan hisoblangan aggregatlar, avtomatik retention. Bu modul g'oyalarni bir marta tushuntiradi va uchta yondashuvni amalda solishtiradi: PostgreSQL extension (TimescaleDB), maxsus TSDB (InfluxDB 3, QuestDB) va Prometheus metrika modeli.
+
+Boshlash: `sql/` I–III bosqich (aggregatsiya, window functions), `postgres/` I–III bosqich (ayniqsa partitioning 35-mavzu va BRIN indeks 13-mavzu foydali, lekin shart emas). `theory/` dagi LSM-tree va columnar storage mavzulari II bosqichdan oldin tanish bo'lsa yaxshi.
+
+Ishlash tartibi: dars `timeseries/docs/NN-slug.md`, kod `timeseries/NN-slug/main.sql` (TimescaleDB va QuestDB uchun SQL), InfluxDB uchun `main.sh` (line protocol yozish va `curl`/`influxdb3` CLI bilan SQL so'rov), test `test.sql` (TimescaleDB'da pgTAP). Ishga tushirish: `make up db=timescale` (yoki `db=influxdb`, `db=questdb`, `db=prometheus`, `db=grafana`), `make ts n=03`, testlar `make ts-test n=03`. Test ma'lumoti (sensor, server metrikasi, kotirovka) `generate_series` yoki kichik Python generator bilan yaratiladi, git'ga kirmaydi.
+
+## Vaqt hisobi
+
+| Bosqich | Mavzular | Umumiy (2–3 soat/kun) | Siz uchun | Sabab |
+|---|---|---|---|---|
+| I: Time-series asoslari | 2 | 1 hafta | 0.5–1 hafta | Monitoring dashboard'larini frontend'dan ko'rgansiz; ichki model yangi |
+| II: TimescaleDB | 5 | 2.5–3 hafta | 2–2.5 hafta | PG bilimiga tayanadi, hypertable va continuous aggregate yangi |
+| III: Maxsus TSDB va metrika tizimlari | 4 | 2 hafta | 2 hafta | Boshqa so'rov modellari (line protocol, PromQL) |
+| IV: Arxitektura va loyiha | 3 | 1.5–2 hafta | 1.5 hafta | |
+| **Jami** | **14** | **7–8 hafta** | **6–7 hafta** (2–3 soat/kun), **3–4 hafta** (5–6 soat/kun) | |
+
+## Boshqa DBlar bilan solishtirish
+
+| Mavzu | TimescaleDB | InfluxDB 3 | QuestDB | Prometheus TSDB | ClickHouse |
+|---|---|---|---|---|---|
+| Asos | PostgreSQL extension | Rust, Apache Arrow/DataFusion, Parquet | Java/C++, columnar | Go, o'z blok formati | columnar OLAP |
+| So'rov tili | to'liq SQL (PG) | SQL va InfluxQL | SQL (`SAMPLE BY`, `LATEST ON`, `ASOF JOIN`) | PromQL | SQL |
+| Yozish | `INSERT`/`COPY` | line protocol (HTTP) | ILP, PG wire, HTTP | scrape (pull), remote write | `INSERT`, Kafka engine |
+| Bo'laklash | vaqt bo'yicha chunk | vaqt bo'yicha Parquet fayllar | vaqt bo'yicha partition | 2 soatlik bloklar | partition + `MergeTree` part'lar |
+| Siqish | columnstore (hypercore) | Parquet | columnar | Gorilla uslubidagi | codec'lar (Delta, Gorilla, ZSTD) |
+| Yuqori kardinallik | yaxshi (oddiy PG ustunlar) | 3.x da tuzatilgan | yaxshi | zaif nuqta | yaxshi |
+| UPDATE/DELETE | to'liq | cheklangan | cheklangan | yo'q | og'ir (mutation) |
+| Qachon | relatsion ma'lumot + vaqt qatori bitta bazada | metrika va hodisalar, katta ingestion | moliya, tick ma'lumot, juda tez ingestion | infratuzilma monitoringi | analitika, loglar (`../clickhouse/`) |
+
+## I bosqich: Time-series asoslari
+1. **Time-series ma'lumot xususiyatlari va modellashtirish**: time-series nima (vaqt, o'lchov, teglar/atributlar), yuklama profili (append-only, yozish ko'p, yangi ma'lumot ko'p o'qiladi, eski ma'lumot aggregat sifatida), regular vs irregular qatorlar, metrika vs hodisa (event) vs log vs trace, narrow (bitta `value` ustun, `metric_name` teg) vs wide (har metrika alohida ustun) jadval modeli, teglar/label'lar va kardinallik tushunchasi (har noyob teg kombinatsiyasi = alohida seriya), vaqt aniqligi (ms, µs, ns) va vaqt zonasi, out-of-order va kech kelgan ma'lumot, oddiy PG jadvalida time-series saqlashning muammolari (indeks o'sishi, `DELETE` retention, VACUUM) amalda o'lchab ko'rish
+2. **Time-series so'rov pattern'lari (oddiy SQL'da)**: vaqt bo'yicha bucket (`date_trunc`, `date_bin` PG14+), oxirgi qiymat (`DISTINCT ON`, `LATERAL`), bo'shliqlarni to'ldirish (`generate_series` + `LEFT JOIN`, LOCF: oxirgi qiymatni olib borish), rate va delta (`LAG`), harakatlanuvchi o'rtacha (window frame `RANGE BETWEEN INTERVAL ... PRECEDING`), percentile (`percentile_cont`), downsampling (1 daqiqalik ma'lumotdan 1 soatlikka), top-N seriyalar, as-of join g'oyasi (ikki qatorni eng yaqin vaqt bo'yicha birlashtirish), BRIN indeks va vaqt bo'yicha partition bilan tezlashtirish, keyingi mavzulardagi maxsus funksiyalar shu pattern'larni qanday soddalashtirishini ko'rish uchun bazaviy o'lchov
+
+## II bosqich: TimescaleDB
+3. **Hypertable va chunk'lar**: `CREATE EXTENSION timescaledb`, `create_hypertable` (yangi sintaksis `CREATE TABLE ... WITH (tsdb.hypertable, ...)` versiyaga qarab), `chunk_time_interval` tanlash (xotiraga sig'adigan "issiq" chunk qoidasi), space partitioning (qo'shimcha o'lcham) va qachon kerak emas, chunk exclusion (pruning) `EXPLAIN` da, `show_chunks`, `timescaledb_information.hypertables`/`chunks` view'lari, indekslar har chunk'da, unique constraint vaqt ustunini o'z ichiga olishi shart, `INSERT`/`COPY` va `timescaledb-parallel-copy`, out-of-order yozish, hypertable vs PG declarative partitioning farqi, litsenziya (Apache vs Timescale License (TSL) funksiyalar) va managed (Timescale Cloud / Tiger Cloud) qisqa
+4. **Maxsus funksiyalar va hyperfunctions**: `time_bucket` (origin, offset, timezone bilan), `time_bucket_gapfill` + `locf()` va `interpolate()`, `first()`/`last()`, `histogram()`, `timescaledb_toolkit` hyperfunctions (`stats_agg`, `percentile_agg`/`approx_percentile` (uddsketch, tdigest), `counter_agg` (counter reset bilan rate), `time_weight` (vaqt bo'yicha vaznli o'rtacha), `asap_smooth`, `lttb` (grafik uchun downsampling), `heartbeat_agg`), two-step aggregatsiya (aggregate → accessor) g'oyasi va nega u continuous aggregate bilan mos keladi, sensor ma'lumotida har birini qo'llash vazifalari
+5. **Continuous aggregates**: materialized view'ning muammosi (to'liq qayta hisoblash), `CREATE MATERIALIZED VIEW ... WITH (timescaledb.continuous)`, refresh policy (`add_continuous_aggregate_policy`: `start_offset`, `end_offset`, `schedule_interval`), real-time aggregation (materializatsiya qilinmagan oxirgi qismni qo'shish) va uni o'chirish, invalidation (eski ma'lumot o'zgarsa), hierarchical continuous aggregates (daqiqa → soat → kun), qo'llab-quvvatlanadigan funksiyalar cheklovlari, `refresh_continuous_aggregate` qo'lda va backfill, `EXPLAIN` bilan oddiy so'rov vs cagg tezligini o'lchash
+6. **Siqish (columnstore), retention va tiering**: native compression/hypercore (row-oriented chunk'ni columnar formatga o'tkazish), `segmentby` (qaysi teg bo'yicha guruhlash) va `orderby` tanlash qoidasi, siqish algoritmlari (delta-of-delta, Gorilla XOR float uchun, dictionary, LZ), `add_compression_policy`/columnstore policy, siqilgan chunk'ga yozish va `UPDATE`/`DELETE` (yangi versiyalarda qo'llab-quvvatlash holati), `hypertable_compression_stats` bilan siqish koeffitsientini o'lchash (10–20x odatiy), `add_retention_policy` va `drop_chunks` (nega `DELETE` dan minglab marta arzon), tiered storage (S3 ga eski chunk'lar) qisqa, background job'lar (`timescaledb_information.jobs`, `job_stats`)
+7. **TimescaleDB ekspluatatsiyasi va unumdorligi**: `timescaledb-tune`, xotira va `chunk_time_interval` bog'liqligi, ko'p hypertable va chunk sonining planner'ga ta'siri, indeks strategiyasi (`(device_id, time DESC)`), oxirgi qiymat so'rovini tezlashtirish (SkipScan), replikatsiya va backup oddiy PG kabi (`pg_dump` bilan ehtiyot choralar: `timescaledb_pre_restore()`/`post_restore()`), versiya upgrade (`ALTER EXTENSION timescaledb UPDATE`), `tsbs` (Time Series Benchmark Suite) bilan yuklama testi, qachon TimescaleDB yetmaydi
+
+## III bosqich: Maxsus TSDB va metrika tizimlari
+8. **InfluxDB 3**: tarix qisqa (1.x TSM va InfluxQL, 2.x Flux va nega Flux tark etildi, 3.x qayta yozilgan: Rust, Apache Arrow, DataFusion, Parquet object storage'da), InfluxDB 3 Core va Enterprise farqi, data model (database, table = measurement, tag, field, timestamp), line protocol (`measurement,tag=v field=1.0 1700000000000000000`, aniqlik, escape qoidalari), HTTP yozish API (`/api/v3/write_lp`) va eski `/api/v2/write` mosligi, SQL bilan so'rov (`date_bin`, `selector_last`), InfluxQL qo'llab-quvvatlash, last value cache va distinct value cache, processing engine (Python plugin'lar) qisqa, retention, Telegraf agent bilan metrika yig'ish, yuqori kardinallik muammosi 3.x da qanday hal qilingani
+9. **QuestDB**: columnar, vaqt bo'yicha partition qilingan, append-optimized saqlash, designated timestamp, `SYMBOL` tipi (dictionary-encoded teg), WAL jadvallar va out-of-order yozish, ingestion (InfluxDB Line Protocol over TCP/HTTP, PG wire protocol), SQL kengaytmalari (`SAMPLE BY ... FILL(PREV/LINEAR/NULL)`, `LATEST ON ... PARTITION BY`, `ASOF JOIN`, `LT JOIN`, `SPLICE JOIN`, `WHERE ts IN '2024-01'` interval sintaksisi), moliyaviy tick ma'lumot misoli (OHLC shamlar, VWAP), deduplication (`DEDUP UPSERT KEYS`), materialized view'lar (yangi versiyalarda), web konsol, unumdorlik va qachon tanlanadi
+10. **Prometheus va metrika modeli**: pull modeli va scrape, metrika turlari (counter, gauge, histogram, summary), label'lar va kardinallik portlashi (foydalanuvchi ID ni label qilish xatosi), TSDB ichki tuzilishi (head block xotirada, WAL, 2 soatlik bloklar, compaction, inverted index label'lar uchun, Gorilla siqish), retention va disk hisoblash, PromQL asoslari (instant vs range vector, `rate`, `irate`, `increase`, `sum by`, `histogram_quantile`, `offset`, recording rules), Prometheus'ning uzoq muddatli saqlash muammosi va yechimlar (remote write, Thanos, Cortex/Mimir, VictoriaMetrics), OpenTelemetry metrikalari qisqa, ilovada metrika chiqarish `../learn-golang`/`../learn-python` observability mavzulariga havola
+11. **Vizualizatsiya va alerting: Grafana**: data source'lar (TimescaleDB/PG, InfluxDB, Prometheus, QuestDB), time-series panel, `$__timeFilter` va `$__timeGroup` makrolari, template o'zgaruvchilar, dashboard so'rovlarini continuous aggregate'ga yo'naltirish (dashboard yuklamasini kamaytirish), alert qoidalari va notification, dashboard-as-code (JSON, provisioning), frontend tajribangiz bilan: grafik uchun downsampling (`lttb`) nega muhim (millionlab nuqta brauzerga yuborilmaydi)
+
+## IV bosqich: Arxitektura va loyiha
+12. **Downsampling, retention va kardinallik strategiyasi**: ko'p qatlamli saqlash (raw 7 kun → 1 daqiqalik 90 kun → 1 soatlik 2 yil), har bazada amalga oshirish (cagg + retention policy, InfluxDB retention, Prometheus recording rules), aggregatlarni to'g'ri saqlash (o'rtachaning o'rtachasi xatosi: sum va count saqlash, percentile uchun sketch), kardinallikni o'lchash va cheklash, teglar dizayni, storage hajmini oldindan hisoblash (seriyalar × nuqtalar × bayt × siqish koeffitsienti), ClickHouse'ni time-series uchun ishlatish (`MergeTree` `ORDER BY (metric, time)`, codec'lar, `../clickhouse/` ga havola) va TSDB bilan solishtirish
+13. **TSDB tanlash va benchmark**: tanlash mezonlari (so'rov tili, ingestion tezligi, kardinallik, relatsion ma'lumot bilan JOIN zarurati, ekotizim, litsenziya, managed variant), `tsbs` yoki o'z generatoringiz bilan uchta bazaga bir xil ma'lumot (masalan 1000 qurilma × 10 metrika × 1 sutka) yuklab ingestion tezligi, disk hajmi va 5 ta tipik so'rov latency'sini o'lchash, natijani jadval va xulosa bilan yozish, benchmark tuzoqlari (kesh, vendor benchmark'lariga ishonmaslik)
+14. **Loyiha: IoT/server monitoring platformasi**: generator (Python yoki Go) qurilmalardan metrika yuboradi (out-of-order va kech kelgan ma'lumot bilan), TimescaleDB'da hypertable + qurilmalar relatsion jadvali (JOIN), hierarchical continuous aggregates, siqish va retention policy, Prometheus + `postgres_exporter` bilan bazaning o'zini monitoring, Grafana dashboard (provisioning bilan git'da) va alert ("qurilma 5 daqiqadan beri jim" `heartbeat_agg` yoki `LATEST`), pgTAP testlari (cagg natijasi to'g'riligi), README'da storage hisobi va benchmark natijalari
+
+## Ataylab kiritilmagan
+Graphite, OpenTSDB, KairosDB kabi eski tizimlar (faqat tarix sifatida tilga olinadi), Apache Druid va Pinot chuqur (real-time OLAP, `../data-engineering/` streaming bosqichida kirish), VictoriaMetrics va Mimir'ni ishga tushirish (faqat arxitektura), Kubernetes'da monitoring stack deploy (`../ops/`). Window functions va aggregatsiya nazariyasi `../sql/` da, partitioning va BRIN `../postgres/` da, LSM va columnar storage nazariyasi `../theory/` da.
+
+## Mezon
+Har mavzu: `make ts n=NN` xatosiz, generator bilan yaratilgan ma'lumot hajmi va so'rov natijalari (latency, `EXPLAIN`, siqish koeffitsienti) kommentga yozilgan, TimescaleDB vazifalarida pgTAP testi o'tadi, `sqlfluff lint` toza. Solishtirish vazifalarida xulosa raqamlar bilan, "tezroq" emas "N marta tezroq, shu sharoitda".
+
+## Manbalar
+- TimescaleDB hujjati: https://docs.timescale.com/ (hypertables, continuous aggregates, compression/hypercore, hyperfunctions)
+- InfluxDB 3 hujjati: https://docs.influxdata.com/influxdb3/core/
+- QuestDB hujjati: https://questdb.com/docs/
+- Prometheus hujjati: https://prometheus.io/docs/ va Brian Brazil, "Prometheus: Up & Running" (2-nashr)
+- Pelkonen va boshq., "Gorilla: A Fast, Scalable, In-Memory Time Series Database" (VLDB 2015)
+- Fabian Reinartz, "Writing a Time Series Database from Scratch": https://fabxc.org/tsdb/
+- Grafana hujjati: https://grafana.com/docs/grafana/latest/
+- Time Series Benchmark Suite: https://github.com/timescale/tsbs
+- Kleppmann, "Designing Data-Intensive Applications" (3-bob, storage va columnar)
